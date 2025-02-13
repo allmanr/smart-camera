@@ -1,0 +1,306 @@
+project_root/
+├── CMakeLists.txt
+├── include/
+│   ├── camera_device.hpp
+│   ├── event_detector.hpp
+│   └── motion_detector.hpp
+├── src/
+│   ├── camera_device.cpp
+│   ├── motion_detector.cpp
+│   └── main.cpp
+└── README.md
+
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.10)
+project(security_camera)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find OpenCV package
+find_package(OpenCV REQUIRED)
+
+# Add include directories
+include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${OpenCV_INCLUDE_DIRS})
+
+# Add source files
+set(SOURCES
+    src/camera_device.cpp
+    src/motion_detector.cpp
+    src/main.cpp
+)
+
+# Create executable
+add_executable(${PROJECT_NAME} ${SOURCES})
+
+# Link libraries
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    ${OpenCV_LIBS}
+    v4l2
+)
+
+# include/camera_device.hpp
+#pragma once
+#include <memory>
+#include <string>
+#include <opencv2/opencv.hpp>
+
+struct Frame {
+    cv::Mat data;
+    std::chrono::system_clock::time_point timestamp;
+};
+
+class V4L2Device {
+public:
+    V4L2Device(const std::string& device);
+    ~V4L2Device();
+    
+    bool open();
+    bool startStreaming();
+    void stopStreaming();
+    std::vector<uint8_t> captureFrame();
+
+private:
+    int fd_;
+    std::string device_path_;
+    bool is_streaming_;
+};
+
+class CameraDevice {
+public:
+    CameraDevice(const std::string& device);
+    ~CameraDevice();
+    
+    Frame captureFrame();
+    void startStream();
+    void stopStream();
+
+private:
+    std::unique_ptr<V4L2Device> device_;
+};
+
+# include/event_detector.hpp
+#pragma once
+#include <opencv2/opencv.hpp>
+#include "camera_device.hpp"
+
+struct EventContext {
+    Frame frame;
+    std::string event_type;
+    double confidence;
+    std::chrono::system_clock::time_point timestamp;
+};
+
+class IEventDetector {
+public:
+    virtual ~IEventDetector() = default;
+    virtual bool detectEvent(const Frame& frame) = 0;
+    virtual void notify(const EventContext& ctx) = 0;
+};
+
+# include/motion_detector.hpp
+#pragma once
+#include "event_detector.hpp"
+#include <opencv2/opencv.hpp>
+
+class MotionDetector : public IEventDetector {
+public:
+    explicit MotionDetector(float threshold = 30.0);
+    bool detectEvent(const Frame& frame) override;
+    void notify(const EventContext& ctx) override;
+
+private:
+    cv::Mat previous_frame_;
+    float threshold_;
+};
+
+# src/camera_device.cpp
+#include "camera_device.hpp"
+#include <stdexcept>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+V4L2Device::V4L2Device(const std::string& device)
+    : device_path_(device), fd_(-1), is_streaming_(false) {}
+
+V4L2Device::~V4L2Device() {
+    if (fd_ >= 0) {
+        if (is_streaming_) {
+            stopStreaming();
+        }
+        close(fd_);
+    }
+}
+
+bool V4L2Device::open() {
+    fd_ = ::open(device_path_.c_str(), O_RDWR);
+    return fd_ >= 0;
+}
+
+bool V4L2Device::startStreaming() {
+    if (fd_ < 0) return false;
+    
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
+        return false;
+    }
+    
+    is_streaming_ = true;
+    return true;
+}
+
+void V4L2Device::stopStreaming() {
+    if (fd_ >= 0 && is_streaming_) {
+        v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(fd_, VIDIOC_STREAMOFF, &type);
+        is_streaming_ = false;
+    }
+}
+
+std::vector<uint8_t> V4L2Device::captureFrame() {
+    // Basic frame capture implementation
+    // You'll need to implement proper V4L2 buffer handling here
+    std::vector<uint8_t> buffer(640 * 480 * 3); // Example size
+    // ... implement actual V4L2 frame capture
+    return buffer;
+}
+
+CameraDevice::CameraDevice(const std::string& device) {
+    device_ = std::make_unique<V4L2Device>(device);
+    if (!device_->open()) {
+        throw std::runtime_error("Failed to open camera device: " + device);
+    }
+}
+
+CameraDevice::~CameraDevice() {
+    if (device_) {
+        stopStream();
+    }
+}
+
+Frame CameraDevice::captureFrame() {
+    Frame frame;
+    frame.timestamp = std::chrono::system_clock::now();
+    
+    auto raw_frame = device_->captureFrame();
+    frame.data = cv::imdecode(raw_frame, cv::IMREAD_COLOR);
+    
+    return frame;
+}
+
+void CameraDevice::startStream() {
+    if (!device_->startStreaming()) {
+        throw std::runtime_error("Failed to start camera stream");
+    }
+}
+
+void CameraDevice::stopStream() {
+    device_->stopStreaming();
+}
+
+# src/motion_detector.cpp
+#include "motion_detector.hpp"
+#include <iostream>
+
+MotionDetector::MotionDetector(float threshold)
+    : threshold_(threshold) {}
+
+bool MotionDetector::detectEvent(const Frame& frame) {
+    cv::Mat current_frame, current_gray, prev_gray, diff;
+    
+    cv::cvtColor(frame.data, current_gray, cv::COLOR_BGR2GRAY);
+    
+    if (previous_frame_.empty()) {
+        previous_frame_ = current_gray.clone();
+        return false;
+    }
+
+    cv::absdiff(current_gray, previous_frame_, diff);
+    cv::threshold(diff, diff, threshold_, 255, cv::THRESH_BINARY);
+    
+    double pixel_diff = (cv::countNonZero(diff) * 100.0) / 
+                       (diff.rows * diff.cols);
+    
+    previous_frame_ = current_gray.clone();
+    
+    return pixel_diff > threshold_;
+}
+
+void MotionDetector::notify(const EventContext& ctx) {
+    std::cout << "Motion detected at " 
+              << std::chrono::system_clock::to_time_t(ctx.timestamp)
+              << " with confidence " << ctx.confidence << std::endl;
+    
+    std::string filename = "motion_" + 
+                          std::to_string(std::chrono::system_clock::to_time_t(ctx.timestamp)) + 
+                          ".jpg";
+    cv::imwrite(filename, ctx.frame.data);
+}
+
+# src/main.cpp
+#include "camera_device.hpp"
+#include "motion_detector.hpp"
+#include <thread>
+#include <chrono>
+#include <iostream>
+
+int main() {
+    try {
+        CameraDevice camera("/dev/video0");
+        camera.startStream();
+        
+        MotionDetector detector(30.0);
+        
+        while (true) {
+            auto frame = camera.captureFrame();
+            
+            if (detector.detectEvent(frame)) {
+                EventContext ctx{
+                    frame,
+                    "motion",
+                    1.0,
+                    std::chrono::system_clock::now()
+                };
+                detector.notify(ctx);
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
+
+# README.md
+# Security Camera System
+
+A C++ security camera system using OpenCV and V4L2 for motion detection.
+
+## Dependencies
+- OpenCV (>= 4.0)
+- V4L2
+- CMake (>= 3.10)
+- C++17 compiler
+
+## Building
+```bash
+mkdir build
+cd build
+cmake ..
+make
+```
+
+## Running
+```bash
+./security_camera
+```
+
+Note: Make sure you have proper permissions to access the camera device (/dev/video0).
